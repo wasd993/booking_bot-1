@@ -28,17 +28,26 @@ async def init_db() -> None:
                 UNIQUE(date, time)
             );
 
-            CREATE TABLE IF NOT EXISTS appointments (
+            CREATE TABLE IF NOT EXISTS specialists (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id    INTEGER NOT NULL,
-                username   TEXT    DEFAULT '',
-                full_name  TEXT    DEFAULT '',
-                date       TEXT    NOT NULL,
-                time       TEXT    NOT NULL,
-                status     TEXT    NOT NULL DEFAULT 'pending',
-                charge_id  TEXT,
-                stars_paid INTEGER NOT NULL DEFAULT 0,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                name       TEXT    NOT NULL,
+                profession TEXT    NOT NULL,
+                is_active  INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS appointments (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id        INTEGER NOT NULL,
+                username       TEXT    DEFAULT '',
+                full_name      TEXT    DEFAULT '',
+                date           TEXT    NOT NULL,
+                time           TEXT    NOT NULL,
+                status         TEXT    NOT NULL DEFAULT 'pending',
+                charge_id      TEXT,
+                stars_paid     INTEGER NOT NULL DEFAULT 0,
+                specialist_id  INTEGER,
+                specialist_name TEXT   DEFAULT '',
+                created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
             );
 
             CREATE TABLE IF NOT EXISTS contacts (
@@ -82,6 +91,24 @@ async def init_db() -> None:
                     "INSERT INTO contacts (label, value) VALUES (?,?)",
                     ("Адрес", "г. Город, ул. Улица, д. 1"),
                 )
+
+        async with db.execute("SELECT COUNT(*) FROM specialists") as cur:
+            if (await cur.fetchone())[0] == 0:
+                async with db.execute("SELECT value FROM settings WHERE key='specialist_name'") as cur2:
+                    specialist_name = (await cur2.fetchone())[0]
+                async with db.execute("SELECT value FROM settings WHERE key='specialist_profession'") as cur3:
+                    specialist_profession = (await cur3.fetchone())[0]
+                await db.execute(
+                    "INSERT INTO specialists (name, profession, is_active) VALUES (?, ?, 1)",
+                    (specialist_name, specialist_profession),
+                )
+
+        async with db.execute("PRAGMA table_info(appointments)") as cur:
+            cols = [row[1] for row in await cur.fetchall()]
+        if "specialist_id" not in cols:
+            await db.execute("ALTER TABLE appointments ADD COLUMN specialist_id INTEGER")
+        if "specialist_name" not in cols:
+            await db.execute("ALTER TABLE appointments ADD COLUMN specialist_name TEXT DEFAULT ''")
 
         await db.commit()
 
@@ -184,6 +211,93 @@ async def delete_schedule_slot(date: str, time: str) -> None:
         await db.commit()
 
 
+async def get_specialists() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM specialists ORDER BY is_active DESC, id"
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_active_specialist() -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM specialists WHERE is_active=1 LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_specialist_by_id(specialist_id: int) -> dict | None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM specialists WHERE id=?",
+            (specialist_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def add_specialist(name: str, profession: str) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM specialists") as cur:
+            count = (await cur.fetchone())[0]
+        is_active = 1 if count == 0 else 0
+        cur = await db.execute(
+            "INSERT INTO specialists (name, profession, is_active) VALUES (?, ?, ?)",
+            (name, profession, is_active),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def set_active_specialist(specialist_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE specialists SET is_active=0")
+        await db.execute(
+            "UPDATE specialists SET is_active=1 WHERE id=?",
+            (specialist_id,),
+        )
+        await db.commit()
+
+
+async def delete_specialist(specialist_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_active FROM specialists WHERE id=?",
+            (specialist_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            active = bool(row and row[0] == 1)
+        await db.execute(
+            "DELETE FROM specialists WHERE id=?",
+            (specialist_id,),
+        )
+        if active:
+            async with db.execute(
+                "SELECT id FROM specialists ORDER BY id LIMIT 1"
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    await db.execute(
+                        "UPDATE specialists SET is_active=1 WHERE id=?",
+                        (row[0],),
+                    )
+        await db.commit()
+
+
+async def update_specialist(specialist_id: int, name: str, profession: str) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE specialists SET name=?, profession=? WHERE id=?",
+            (name, profession, specialist_id),
+        )
+        await db.commit()
+
+
 # ──────────────────────────────────────────────
 # Записи (appointments)
 # ──────────────────────────────────────────────
@@ -194,6 +308,8 @@ async def try_create_appointment(
     full_name: str,
     date: str,
     time: str,
+    specialist_id: int | None = None,
+    specialist_name: str = "",
 ) -> int | None:
     """
     Атомарная попытка занять слот.
@@ -210,9 +326,9 @@ async def try_create_appointment(
                 return None  # занято
 
         cur = await db.execute("""
-            INSERT INTO appointments (user_id, username, full_name, date, time, status)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (user_id, username, full_name, date, time))
+            INSERT INTO appointments (user_id, username, full_name, date, time, status, specialist_id, specialist_name)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (user_id, username, full_name, date, time, specialist_id, specialist_name))
         await db.commit()
         return cur.lastrowid
 
